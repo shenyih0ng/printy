@@ -30,8 +30,8 @@ def_cmd!(CMD_RT_STATUS, _CMD_RT_STATUS, req: RtStatusReq);
 #[derive(Debug)]
 pub(crate) struct PrinterError {
     is_cutter_error: bool,
-    is_unrecoverable_error: bool,
-    is_auto_recoverable_error: bool,
+    is_fatal_error: bool,
+    is_recoverable_error: bool,
 }
 
 #[derive(Debug)]
@@ -104,8 +104,8 @@ impl PrinterStatus {
         }
 
         let is_cutter_error = (error_cause & 0b1000) != 0;
-        let is_unrecoverable_error = (error_cause & 0b100000) != 0;
-        let is_auto_recoverable_error = (error_cause & 0b1000000) != 0;
+        let is_fatal_error = (error_cause & 0b100000) != 0;
+        let is_recoverable_error = (error_cause & 0b1000000) != 0;
 
         Some(Self {
             is_online,
@@ -114,8 +114,8 @@ impl PrinterStatus {
                 is_paper_empty,
                 error: Some(PrinterError {
                     is_cutter_error,
-                    is_unrecoverable_error,
-                    is_auto_recoverable_error,
+                    is_fatal_error,
+                    is_recoverable_error,
                 }),
             }),
             paper_status,
@@ -124,41 +124,61 @@ impl PrinterStatus {
 }
 
 impl Display for PrinterStatus {
-    #[rustfmt::skip]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Status: {}\nPaper: {}",
-            if self.is_online { "\x1b[32;1mONLINE\x1b[0m" } else { "\x1b[31;1mOFFLINE\x1b[0m" },
-            match self.paper_status {
-                PaperStatus::NotPresent => "\x1b[31;1mNOT DETECTED\x1b[0m",
-                PaperStatus::NearEnd => "\x1b[33;1mRUNNING OUT\x1b[0m",
-                PaperStatus::Adequate => "\x1b[32;1mADEQUATE\x1b[0m",
+        const GREEN: &str = "\x1b[32;1m";
+        const RED: &str = "\x1b[31;1m";
+        const YELLOW: &str = "\x1b[33;1m";
+        const MAGENTA: &str = "\x1b[35m";
+        const RESET: &str = "\x1b[0m";
+
+        let status_text = if self.is_online {
+            format!("{GREEN}ONLINE{RESET}")
+        } else {
+            format!("{RED}OFFLINE{RESET}")
+        };
+
+        let paper_text = match self.paper_status {
+            PaperStatus::Adequate => format!("{GREEN}OK{RESET}"),
+            PaperStatus::NotPresent => format!("{RED}EMPTY{RESET}"),
+            PaperStatus::NearEnd => format!("{YELLOW}LOW{RESET}"),
+        };
+
+        write!(f, "Status: {status_text} - Paper: {paper_text}")?;
+
+        if !self.is_online {
+            if let Some(cause) = &self.offline_cause {
+                let mut issues = Vec::new();
+
+                if let Some(error) = &cause.error {
+                    if error.is_fatal_error {
+                        issues.push(format!("{RED}fatal-error{RESET}"));
+                    }
+                    if error.is_recoverable_error {
+                        issues.push(format!("{YELLOW}auto-recovery{RESET}"));
+                    }
+                    if error.is_cutter_error {
+                        issues.push(format!("{MAGENTA}cutter-error{RESET}"));
+                    }
+                }
+
+                if cause.is_cover_open {
+                    issues.push(format!("{MAGENTA}cover-open{RESET}"));
+                }
+                if cause.is_paper_empty {
+                    issues.push(format!("{MAGENTA}no-paper{RESET}"));
+                }
+
+                if !issues.is_empty() {
+                    write!(f, " - Issues: {}", issues.join(", "))?;
+                }
             }
-        ).unwrap();
-
-        if !self.is_online && self.offline_cause.is_some() {
-            let cause = self.offline_cause.as_ref().unwrap();
-            let mut reasons = Vec::new();
-
-            if cause.is_cover_open { reasons.push("Cover is open"); }
-            if cause.is_paper_empty { reasons.push("Out of paper"); }
-
-            if let Some(error) = &cause.error {
-                if error.is_cutter_error { reasons.push("Cutter error"); }
-                if error.is_unrecoverable_error { reasons.push("Unrecoverable error"); }
-                if error.is_auto_recoverable_error { reasons.push("Auto-recoverable error"); }
-            }
-
-            writeln!(f).unwrap();
-            reasons
-                .iter()
-                .for_each(|r| write!(f, "\n\x1b[31;1m[Error]\x1b[0m {}", r).unwrap());
         }
 
         Ok(())
     }
 }
+
+pub(crate) const CMD_DISABLE_ASB: &[u8] = &[GS, b'a', 0];
 
 pub(crate) const CMD_PRINT_AND_FEED: &[u8] = &[0x0A]; // LF
 
@@ -170,3 +190,5 @@ pub(crate) const CMD_CUT: &[u8] = &[GS, b'V', b'1'];
 pub(crate) const CMD_BOLD: &[u8] = &[ESC, b'E'];
 pub(crate) const CMD_UNDERLINE: &[u8] = &[ESC, b'-'];
 pub(crate) const CMD_CHAR_SIZE: &[u8] = &[ESC, b'!'];
+
+pub(crate) const CMD_PROC_DELAY_MS: u64 = 500;

@@ -1,22 +1,56 @@
+use rusb::{Context, DeviceHandle, Direction, TransferType, UsbContext};
 use std::{
-    io::{self, Error, Read, Write},
+    fmt,
+    io::{self, Write},
+    thread::sleep,
     time::Duration,
 };
 
-use rusb::{Context, DeviceHandle, Direction, TransferType, UsbContext};
+use crate::escpos::{
+    CMD_DISABLE_ASB, CMD_INIT, CMD_PROC_DELAY_MS, CMD_RT_STATUS, PrinterStatus, RtStatusReq,
+};
 
-use crate::escpos::{CMD_INIT, CMD_RT_STATUS, PrinterStatus, RtStatusReq};
+#[derive(Debug)]
+pub enum PrinterError {
+    Driver(String),
+}
+
+impl fmt::Display for PrinterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PrinterError::Driver(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for PrinterError {}
+
+impl From<io::Error> for PrinterError {
+    fn from(err: io::Error) -> Self {
+        PrinterError::Driver(format!("[I/O]: {}", err))
+    }
+}
+
+impl From<rusb::Error> for PrinterError {
+    fn from(err: rusb::Error) -> Self {
+        PrinterError::Driver(format!("[USB]: {}", err))
+    }
+}
+
+pub type PrinterResult<T> = Result<T, PrinterError>;
 
 pub trait Driver {
-    fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
+    fn read(&self, buf: &mut [u8]) -> PrinterResult<usize>;
 
-    fn write(&self, data: &[u8]) -> io::Result<()>;
+    fn write(&self, data: &[u8]) -> PrinterResult<()>;
+
+    fn drain(&self) -> PrinterResult<()>;
 }
 
 pub struct DebugDriver;
 
 impl Driver for DebugDriver {
-    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&self, buf: &mut [u8]) -> PrinterResult<usize> {
         print!("Read (hex): ");
         io::stdout().flush()?;
 
@@ -41,22 +75,24 @@ impl Driver for DebugDriver {
                 buf[..bytes_to_copy].copy_from_slice(&values[..bytes_to_copy]);
                 Ok(bytes_to_copy)
             }
-            Err(_) => Err(Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid hex format. Use format like: 0x41 0x42 or 41 42",
+            Err(_) => Err(PrinterError::Driver(
+                "Invalid hex format. Use format like: 0x41 0x42 or 41 42".to_owned(),
             )),
         }
     }
 
-    fn write(&self, data: &[u8]) -> io::Result<()> {
-        println!(
+    fn write(&self, data: &[u8]) -> PrinterResult<()> {
+        Ok(println!(
             "Write: [{}]",
             data.iter()
                 .map(|b| format!("0x{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
-        Ok(())
+        ))
+    }
+
+    fn drain(&self) -> PrinterResult<()> {
+        unimplemented!();
     }
 }
 
@@ -125,23 +161,54 @@ impl UsbDriver {
     }
 }
 
+impl UsbDriver {
+    fn _io_with_retry<F, T>(&self, ept_addr: u8, mut io_func: F) -> PrinterResult<T>
+    where
+        F: FnMut() -> rusb::Result<T>,
+    {
+        io_func().or_else(|e: rusb::Error| {
+            if e == rusb::Error::Pipe {
+                self.dev.clear_halt(ept_addr)?;
+                sleep(Duration::from_millis(CMD_PROC_DELAY_MS));
+                io_func().map_err(PrinterError::from)
+            } else {
+                Err(e.into())
+            }
+        })
+    }
+}
+
 impl Driver for UsbDriver {
-    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.dev.read_bulk(self.in_ept_addr, buf, self.io_timeout) {
-            Ok(len) => Ok(len),
-            Err(e) => Err(Error::new(io::ErrorKind::Other, e)),
+    fn read(&self, buf: &mut [u8]) -> PrinterResult<usize> {
+        self._io_with_retry(self.in_ept_addr, || {
+            self.dev.read_bulk(self.in_ept_addr, buf, self.io_timeout)
+        })
+    }
+
+    fn write(&self, data: &[u8]) -> PrinterResult<()> {
+        match self._io_with_retry(self.out_ept_addr, || {
+            self.dev
+                .write_bulk(self.out_ept_addr, data, self.io_timeout)
+        })? {
+            w_len if w_len == data.len() => Ok(()),
+            w_len => Err(PrinterError::Driver(format!(
+                "Partial write: expected {}, got {} - data: {:02x?}",
+                data.len(),
+                w_len,
+                &data[..w_len]
+            ))),
         }
     }
 
-    fn write(&self, data: &[u8]) -> io::Result<()> {
-        match self
-            .dev
-            .write_bulk(self.out_ept_addr, data, self.io_timeout)
-        {
-            Ok(len) if len == data.len() => Ok(()),
-            Ok(_) => Err(Error::new(io::ErrorKind::Other, "Incomplete write")),
-            Err(e) => Err(Error::new(io::ErrorKind::Other, e)),
+    fn drain(&self) -> PrinterResult<()> {
+        let mut _buf = [0u8; 16];
+        loop {
+            let read_len = self.read(&mut _buf)?;
+            if read_len == 0 {
+                break;
+            }
         }
+        Ok(())
     }
 }
 
@@ -150,26 +217,52 @@ pub struct Printer<D> {
 }
 
 impl Printer<UsbDriver> {
-    pub fn usb(vid: u16, pid: u16) -> Self {
+    pub fn usb(vid: u16, pid: u16) -> PrinterResult<Self> {
         Self::new(UsbDriver::new(vid, pid))
     }
 }
 
 impl Printer<DebugDriver> {
-    pub fn debug() -> Self {
+    pub fn debug() -> PrinterResult<Self> {
         Self::new(DebugDriver)
     }
 }
 
 impl<D: Driver> Printer<D> {
-    pub fn new(driver: D) -> Self {
+    pub fn new(driver: D) -> PrinterResult<Self> {
         let printer = Printer { driver };
-        printer.init().unwrap();
-        printer
+        printer.init()?;
+        Ok(printer)
     }
 
-    fn init(&self) -> io::Result<()> {
-        self.driver.write(CMD_INIT)
+    fn init(&self) -> PrinterResult<()> {
+        /*
+          The printer (`TM-T88IV`) seems to transmit a 7-byte long data sequence (via the BULK endpoint)
+          upon powering on. This is not explicitly documented in the manual.
+
+          The sequence is as follows: [0x3B, 0x31, 0x0, 0x14, 0x0, 0x0, 0x0F]
+            - The first three bytes [0x3B, 0x31, 0x0] corresponds the closest to the transmitted
+              response of a power-off command (`DLE DC4 (fn=2)`).
+              - However, the identifier (`0x31`) does not match the expected value (`0x30`) according
+                to the specification.
+              - `TM-T88IV` does NOT support the power-off command (according to the `ESC/POS` manual),
+                which could a possible explanation for the mismatch.
+            - The remaining four bytes is the mysterious part, which seems to be a mixture of message
+              terminators and undocumented start-up/initialization sequences.
+
+          If the printer is powered on with an OFFLINE state (e.g. cover is open, paper is out), there
+          will be additional 4 bytes of `ASB` (Automatic Status Back) message (which seems to also
+          suggest that `ASB` is enabled by default).
+
+          As such, we will drain these initial bytes to avoid any issues with message backlogging
+          (transmitted data is only cleared after host reads it).
+        */
+        self.driver.drain()?;
+        self.driver.write(CMD_INIT)?;
+        // NOTE: Only works (reliably) if the printer (`TM-T88IV`) is powered on with an ONLINE state
+        // Else, `ASB` sequences will still be transmitted
+        self.driver.write(CMD_DISABLE_ASB)?;
+        Ok(())
     }
 
     pub fn status(&self) -> Option<PrinterStatus> {
@@ -182,17 +275,12 @@ impl<D: Driver> Printer<D> {
         .concat();
         self.driver.write(batched_status_cmds.as_slice()).unwrap();
 
+        sleep(Duration::from_millis(CMD_PROC_DELAY_MS));
+
         let mut buf = [0u8; 4];
         match self.driver.read(&mut buf) {
-            Ok(len) if len == 4 => PrinterStatus::from_bytes(&buf),
-            Ok(_) => {
-                eprintln!("Received incomplete status response from printer.");
-                None
-            }
-            Err(e) => {
-                eprintln!("Failed to read printer status: {}", e);
-                None
-            }
+            Ok(len) if len == buf.len() => PrinterStatus::from_bytes(&buf),
+            _ => None,
         }
     }
 }
