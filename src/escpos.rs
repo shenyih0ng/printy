@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use derive_builder::Builder;
+
 macro_rules! def_cmd {
     ($fn_name:ident, $header:expr, $( $param_name:ident : $param_type:ty ),+) => {
         #[allow(non_snake_case)]
@@ -27,28 +29,28 @@ pub(crate) enum RtStatusReq {
 }
 def_cmd!(CMD_RT_STATUS, _CMD_RT_STATUS, req: RtStatusReq);
 
-#[derive(Debug)]
+#[derive(Debug, Builder, Clone)]
 pub(crate) struct PrinterError {
-    is_cutter_error: bool,
-    is_fatal_error: bool,
-    is_recoverable_error: bool,
+    is_cutter_err: bool,
+    is_fatal_err: bool,
+    is_recoverable_err: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Builder, Clone)]
 pub(crate) struct OfflineCause {
     is_cover_open: bool,
     is_paper_empty: bool,
     error: Option<PrinterError>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum PaperStatus {
     Adequate,
     NearEnd,
     NotPresent,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Builder)]
 pub(crate) struct PrinterStatus {
     is_online: bool,
     offline_cause: Option<OfflineCause>,
@@ -57,69 +59,53 @@ pub(crate) struct PrinterStatus {
 
 impl PrinterStatus {
     pub(crate) fn from_bytes(bytes: &[u8; 4]) -> Option<Self> {
+        // All bit masks used below are based on the ESC/POS `DLE EOT` status response format.
+        // Reference: https://download4.epson.biz/sec_pubs/pos/reference_en/escpos/dle_eot.html
         if !bytes.iter().all(|&b| (b & 0b10010011) == 0b00010010) {
             // If the status bytes do not match the expected format, stop parsing and treat
             // it as an indeterminate status
             return None;
         }
-        let [printer_status, offline_cause, error_cause, paper_status] = bytes;
+        let [dev_status_b, off_cause_b, err_cause_b, paper_status_b] = bytes;
 
-        let is_online = (printer_status & 0b1000) == 0;
-        // NOTE: Assume that end sensor and near-end sensor has a relationship where if
-        // the end sensor detects NO paper, values do not matter for the near-end sensor.
-        // On the other hand, we assume that if there is paper present (detected by the end sensor),
-        // we only care about the value of the near-end sensor
-        let paper_status = {
-            let is_present = (paper_status & 0b1100000) == 0;
-            let is_near_end = (paper_status & 0b1100) != 0;
-            match (is_present, is_near_end) {
-                (true, true) => PaperStatus::NearEnd,
-                (true, false) => PaperStatus::Adequate,
-                (false, _) => PaperStatus::NotPresent,
-            }
+        let is_online = (dev_status_b & 0b1000) == 0;
+
+        let off_err = if (off_cause_b & 0b1000000) != 0 {
+            PrinterErrorBuilder::default()
+                .is_cutter_err((err_cause_b & 0b1000) != 0)
+                .is_fatal_err((err_cause_b & 0b100000) != 0)
+                .is_recoverable_err((err_cause_b & 0b1000000) != 0)
+                .build()
+                .ok()
+        } else {
+            None
         };
 
-        if is_online {
-            return Some(Self {
-                is_online,
-                offline_cause: None,
-                paper_status,
-            });
-        }
+        let off_cause = if !is_online {
+            OfflineCauseBuilder::default()
+                .is_cover_open((off_cause_b & 0b100) != 0)
+                .is_paper_empty((off_cause_b & 0b100000) != 0)
+                .error(off_err)
+                .build()
+                .ok()
+        } else {
+            None
+        };
 
-        let is_cover_open = (offline_cause & 0b100) != 0;
-        let is_paper_empty = (offline_cause & 0b100000) != 0;
-        let is_error = (offline_cause & 0b1000000) != 0;
-
-        if !is_error {
-            return Some(Self {
-                is_online,
-                offline_cause: Some(OfflineCause {
-                    is_cover_open,
-                    is_paper_empty,
-                    error: None,
-                }),
-                paper_status,
-            });
-        }
-
-        let is_cutter_error = (error_cause & 0b1000) != 0;
-        let is_fatal_error = (error_cause & 0b100000) != 0;
-        let is_recoverable_error = (error_cause & 0b1000000) != 0;
-
-        Some(Self {
-            is_online,
-            offline_cause: Some(OfflineCause {
-                is_cover_open,
-                is_paper_empty,
-                error: Some(PrinterError {
-                    is_cutter_error,
-                    is_fatal_error,
-                    is_recoverable_error,
-                }),
-            }),
-            paper_status,
-        })
+        PrinterStatusBuilder::default()
+            .is_online(is_online)
+            // Paper sensor logic hierarchy (assumed):
+            // 1. End sensor takes priority - if it detects no paper, status is `NotPresent` regardless
+            //    of near-end sensor
+            // 2. If end sensor detects paper is present, then check near-end sensor:
+            .paper_status(match paper_status_b {
+                paper_status_b if (paper_status_b & 0b1100000) != 0 => PaperStatus::NotPresent,
+                paper_status_b if (paper_status_b & 0b1100) != 0 => PaperStatus::NearEnd,
+                _ => PaperStatus::Adequate,
+            })
+            .offline_cause(off_cause)
+            .build()
+            .ok()
     }
 }
 
@@ -150,13 +136,13 @@ impl Display for PrinterStatus {
                 let mut issues = Vec::new();
 
                 if let Some(error) = &cause.error {
-                    if error.is_fatal_error {
+                    if error.is_fatal_err {
                         issues.push(format!("{RED}fatal-error{RESET}"));
                     }
-                    if error.is_recoverable_error {
+                    if error.is_recoverable_err {
                         issues.push(format!("{YELLOW}auto-recovery{RESET}"));
                     }
-                    if error.is_cutter_error {
+                    if error.is_cutter_err {
                         issues.push(format!("{MAGENTA}cutter-error{RESET}"));
                     }
                 }
