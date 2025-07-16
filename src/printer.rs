@@ -11,51 +11,69 @@ use crate::escpos::{
 };
 
 #[derive(Debug)]
-pub enum PrinterError {
-    Driver(String),
+pub enum DriverKind {
+    Debug,
+    Usb,
 }
 
-impl fmt::Display for PrinterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+#[derive(Debug)]
+pub enum PrintyError {
+    Driver {
+        kind: DriverKind,
+        context: String,
+        source: Option<Box<dyn std::error::Error>>,
+    },
+}
+
+impl fmt::Display for PrintyError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            PrinterError::Driver(msg) => write!(f, "{msg}"),
+            PrintyError::Driver {
+                kind,
+                context,
+                source,
+            } => {
+                write!(
+                    f,
+                    "Driver ({}) error: {}",
+                    match kind {
+                        DriverKind::Debug => "Debug",
+                        DriverKind::Usb => "USB",
+                    },
+                    context
+                )?;
+
+                if let Some(source_err) = source {
+                    write!(f, " - {}", source_err)?;
+                }
+
+                Ok(())
+            }
         }
     }
 }
 
-impl std::error::Error for PrinterError {}
+impl std::error::Error for PrintyError {}
 
-impl From<io::Error> for PrinterError {
-    fn from(err: io::Error) -> Self {
-        PrinterError::Driver(format!("[I/O]: {}", err))
-    }
-}
-
-impl From<rusb::Error> for PrinterError {
-    fn from(err: rusb::Error) -> Self {
-        PrinterError::Driver(format!("[USB]: {}", err))
-    }
-}
-
-pub type PrinterResult<T> = Result<T, PrinterError>;
+pub type PrintyResult<T> = Result<T, PrintyError>;
 
 pub trait Driver {
-    fn read(&self, buf: &mut [u8]) -> PrinterResult<usize>;
+    fn read(&self, buf: &mut [u8]) -> PrintyResult<usize>;
 
-    fn write(&self, data: &[u8]) -> PrinterResult<()>;
+    fn write(&self, data: &[u8]) -> PrintyResult<usize>;
 
-    fn drain(&self) -> PrinterResult<()>;
+    fn drain(&self) -> PrintyResult<()>;
 }
 
 pub struct DebugDriver;
 
 impl Driver for DebugDriver {
-    fn read(&self, buf: &mut [u8]) -> PrinterResult<usize> {
+    fn read(&self, buf: &mut [u8]) -> PrintyResult<usize> {
         print!("Read (hex): ");
-        io::stdout().flush()?;
+        io::stdout().flush().ok();
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        io::stdin().read_line(&mut input).ok();
 
         let hex_values: Result<Vec<u8>, _> = input
             .trim()
@@ -75,24 +93,28 @@ impl Driver for DebugDriver {
                 buf[..bytes_to_copy].copy_from_slice(&values[..bytes_to_copy]);
                 Ok(bytes_to_copy)
             }
-            Err(_) => Err(PrinterError::Driver(
-                "Invalid hex format. Use format like: 0x41 0x42 or 41 42".to_owned(),
-            )),
+            Err(_) => Err(PrintyError::Driver {
+                kind: DriverKind::Debug,
+                context: "Invalid hex format. Use format like: '0x41', '0x42' or '41', '42'"
+                    .to_string(),
+                source: None,
+            }),
         }
     }
 
-    fn write(&self, data: &[u8]) -> PrinterResult<()> {
-        Ok(println!(
+    fn write(&self, data: &[u8]) -> PrintyResult<usize> {
+        println!(
             "Write: [{}]",
             data.iter()
                 .map(|b| format!("0x{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ))
+        );
+        Ok(data.len())
     }
 
-    fn drain(&self) -> PrinterResult<()> {
-        unimplemented!();
+    fn drain(&self) -> PrintyResult<()> {
+        Ok(())
     }
 }
 
@@ -104,9 +126,9 @@ pub struct UsbDriver {
 }
 
 impl UsbDriver {
-    pub fn new(vid: u16, pid: u16) -> Self {
+    pub fn new(vid: u16, pid: u16) -> PrintyResult<Self> {
         let usb_ctx = Context::new().unwrap();
-        let usb_devs = usb_ctx.devices().expect("Failed to get USB devices!");
+        let usb_devs = usb_ctx.devices().unwrap();
 
         let print_dev = usb_devs
             .iter()
@@ -114,7 +136,11 @@ impl UsbDriver {
                 Ok(dev_desc) => (dev_desc.vendor_id(), dev_desc.product_id()) == (vid, pid),
                 _ => false,
             })
-            .expect(&format!("Device ({}, {}) not found!", vid, pid));
+            .ok_or(PrintyError::Driver {
+                kind: DriverKind::Usb,
+                context: format!("Device with VID: {vid:#04x}, PID: {pid:#04x} not found"),
+                source: None,
+            })?;
 
         let (in_ept_addr, out_ept_addr, if_num) = print_dev
             .active_config_descriptor()
@@ -144,63 +170,90 @@ impl UsbDriver {
                 }
             })
             .next()
-            .expect("Failed to find bulk endpoints for the device!");
+            .ok_or(PrintyError::Driver {
+                kind: DriverKind::Usb,
+                context: format!(
+                    "No suitable bulk endpoints found for device with VID: {vid:#04x}, PID: {pid:#04x}"
+                ),
+                source: None
+            })?;
 
         let print_dev_handle = print_dev.open().expect("Failed to open device!");
         print_dev_handle
             .claim_interface(if_num)
-            .expect("Failed to claim device USB interface!");
+            .map_err(|e| PrintyError::Driver {
+                kind: DriverKind::Usb,
+                context: format!("Failed to claim USB interface {}", if_num),
+                source: Some(Box::new(e)),
+            })?;
 
-        Self {
+        Ok(Self {
             dev: print_dev_handle,
             in_ept_addr,
             out_ept_addr,
             // NOTE: For now, default timeout seems sufficient, unless we need to allow user to configure it in the future
             io_timeout: Duration::from_secs(5),
-        }
+        })
     }
 }
 
 impl UsbDriver {
-    fn _io_with_retry<F, T>(&self, ept_addr: u8, mut io_func: F) -> PrinterResult<T>
+    fn _io_with_retry<F, T>(&self, ept_addr: u8, mut io_func: F) -> PrintyResult<T>
     where
         F: FnMut() -> rusb::Result<T>,
     {
-        io_func().or_else(|e: rusb::Error| {
-            if e == rusb::Error::Pipe {
-                self.dev.clear_halt(ept_addr)?;
+        io_func().or_else(|e: rusb::Error| match e {
+            rusb::Error::Pipe => {
+                self.dev
+                    .clear_halt(ept_addr)
+                    .map_err(|e| PrintyError::Driver {
+                        kind: DriverKind::Usb,
+                        context: format!("Failed to clear halt on endpoint {ept_addr:#04x}"),
+                        source: Some(Box::new(e)),
+                    })?;
                 sleep(Duration::from_millis(CMD_PROC_DELAY_MS));
-                io_func().map_err(PrinterError::from)
-            } else {
-                Err(e.into())
+                io_func().map_err(|e| PrintyError::Driver {
+                    kind: DriverKind::Usb,
+                    context: format!("Failed to retry I/O operation on endpoint {ept_addr:#04x}"),
+                    source: Some(Box::new(e)),
+                })
             }
+            _ => Err(PrintyError::Driver {
+                kind: DriverKind::Usb,
+                context: format!("I/O error on endpoint {ept_addr:#04x}: {}", e),
+                source: Some(Box::new(e)),
+            }),
         })
     }
 }
 
 impl Driver for UsbDriver {
-    fn read(&self, buf: &mut [u8]) -> PrinterResult<usize> {
+    fn read(&self, buf: &mut [u8]) -> PrintyResult<usize> {
         self._io_with_retry(self.in_ept_addr, || {
             self.dev.read_bulk(self.in_ept_addr, buf, self.io_timeout)
         })
     }
 
-    fn write(&self, data: &[u8]) -> PrinterResult<()> {
+    fn write(&self, data: &[u8]) -> PrintyResult<usize> {
         match self._io_with_retry(self.out_ept_addr, || {
             self.dev
                 .write_bulk(self.out_ept_addr, data, self.io_timeout)
         })? {
-            w_len if w_len == data.len() => Ok(()),
-            w_len => Err(PrinterError::Driver(format!(
-                "Partial write: expected {}, got {} - data: {:02x?}",
-                data.len(),
-                w_len,
-                &data[..w_len]
-            ))),
+            w_len if w_len == data.len() => Ok(w_len),
+            w_len => Err(PrintyError::Driver {
+                kind: DriverKind::Usb,
+                context: format!(
+                    "Partial write: expected {}, got {} - data: {:02x?}",
+                    data.len(),
+                    w_len,
+                    &data[..w_len]
+                ),
+                source: None,
+            }),
         }
     }
 
-    fn drain(&self) -> PrinterResult<()> {
+    fn drain(&self) -> PrintyResult<()> {
         let mut _buf = [0u8; 16];
         loop {
             let read_len = self.read(&mut _buf)?;
@@ -217,25 +270,25 @@ pub struct Printer<D> {
 }
 
 impl Printer<UsbDriver> {
-    pub fn usb(vid: u16, pid: u16) -> PrinterResult<Self> {
-        Self::new(UsbDriver::new(vid, pid))
+    pub fn usb(vid: u16, pid: u16) -> PrintyResult<Self> {
+        Self::new(UsbDriver::new(vid, pid)?)
     }
 }
 
 impl Printer<DebugDriver> {
-    pub fn debug() -> PrinterResult<Self> {
+    pub fn debug() -> PrintyResult<Self> {
         Self::new(DebugDriver)
     }
 }
 
 impl<D: Driver> Printer<D> {
-    pub fn new(driver: D) -> PrinterResult<Self> {
+    pub fn new(driver: D) -> PrintyResult<Self> {
         let printer = Printer { driver };
         printer.init()?;
         Ok(printer)
     }
 
-    fn init(&self) -> PrinterResult<()> {
+    fn init(&self) -> PrintyResult<()> {
         /*
           The printer (`TM-T88IV`) seems to transmit a 7-byte long data sequence (via the BULK endpoint)
           upon powering on. This is not explicitly documented in the manual.

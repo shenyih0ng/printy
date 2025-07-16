@@ -1,11 +1,11 @@
-use crate::printer::{Printer, PrinterResult};
+use crate::printer::{Printer, PrintyResult};
 
 mod escpos;
 mod printer;
 
 const TM_T88IV_USB_ID: (u16, u16) = (0x4b8, 0x202);
 
-fn main() -> PrinterResult<()> {
+fn main() -> PrintyResult<()> {
     let printer = Printer::usb(TM_T88IV_USB_ID.0, TM_T88IV_USB_ID.1)?;
     // let printer = Printer::debug()?;
     loop {
