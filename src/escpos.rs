@@ -6,9 +6,7 @@ macro_rules! def_cmd {
     ($fn_name:ident, $header:expr, $( $param_name:ident : $param_type:ty ),+) => {
         #[allow(non_snake_case)]
         pub(crate) fn $fn_name($( $param_name: $param_type ),+) -> Vec<u8> {
-            let mut command = $header.to_vec();
-            $( command.push($param_name as u8); )+
-            command
+            [$header, &[$($param_name as u8),+]].concat()
         }
     };
 }
@@ -166,15 +164,31 @@ impl Display for PrinterStatus {
 
 pub(crate) const CMD_DISABLE_ASB: &[u8] = &[GS, b'a', 0];
 
-pub(crate) const CMD_PRINT_AND_FEED: &[u8] = &[0x0A]; // LF
+// Feeds paper to `[cutting_position + n * vert_motion]` and cut
+// n is set to 0, which means the printer will cut right after the last printed line
+pub(crate) const CMD_CUT: &[u8] = &[GS, b'V', 66, 0];
 
-const _CMD_PRINT_AND_FEED_N: &[u8] = &[ESC, b'd'];
-def_cmd!(CMD_PRINT_AND_FEED_N, _CMD_PRINT_AND_FEED_N, n: u8);
+pub(crate) const _CMD_BOLD: &[u8] = &[ESC, b'E'];
+def_cmd!(CMD_BOLD, _CMD_BOLD, enable: bool);
 
-pub(crate) const CMD_CUT: &[u8] = &[GS, b'V', b'1'];
+pub(crate) const _CMD_UNDERLINE: &[u8] = &[ESC, b'-'];
+def_cmd!(CMD_UNDERLINE, _CMD_UNDERLINE, enable: bool);
 
-pub(crate) const CMD_BOLD: &[u8] = &[ESC, b'E'];
-pub(crate) const CMD_UNDERLINE: &[u8] = &[ESC, b'-'];
-pub(crate) const CMD_CHAR_SIZE: &[u8] = &[ESC, b'!'];
+#[allow(non_snake_case)]
+pub(crate) fn CMD_CHAR_SIZE(h_magnify: u8, w_magnify: u8) -> Vec<u8> {
+    vec![
+        GS,
+        b'!',
+        (w_magnify.clamp(0, 8) << 4) | h_magnify.clamp(0, 8),
+    ]
+}
+
+pub(crate) const _CMD_JUSTIFY: &[u8] = &[ESC, b'a'];
+pub(crate) enum JustifyReq {
+    Left = 0,
+    Center = 1,
+    Right = 2,
+}
+def_cmd!(CMD_JUSTIFY, _CMD_JUSTIFY, req: JustifyReq);
 
 pub(crate) const CMD_PROC_DELAY_MS: u64 = 500;

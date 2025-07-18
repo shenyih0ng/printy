@@ -7,8 +7,11 @@ use std::{
 };
 
 use crate::escpos::{
-    CMD_DISABLE_ASB, CMD_INIT, CMD_PROC_DELAY_MS, CMD_RT_STATUS, PrinterStatus, RtStatusReq,
+    CMD_BOLD, CMD_CHAR_SIZE, CMD_CUT, CMD_DISABLE_ASB, CMD_INIT, CMD_PROC_DELAY_MS, CMD_RT_STATUS,
+    CMD_UNDERLINE, PrinterStatus, RtStatusReq,
 };
+
+use markdown::{mdast, to_mdast};
 
 #[derive(Debug)]
 pub enum DriverKind {
@@ -20,6 +23,10 @@ pub enum DriverKind {
 pub enum PrintyError {
     Driver {
         kind: DriverKind,
+        context: String,
+        source: Option<Box<dyn std::error::Error>>,
+    },
+    Parse {
         context: String,
         source: Option<Box<dyn std::error::Error>>,
     },
@@ -47,6 +54,13 @@ impl fmt::Display for PrintyError {
                     write!(f, " - {}", source_err)?;
                 }
 
+                Ok(())
+            }
+            PrintyError::Parse { context, source } => {
+                write!(f, "Parse error: {}", context)?;
+                if let Some(source_err) = source {
+                    write!(f, " - {}", source_err)?;
+                }
                 Ok(())
             }
         }
@@ -138,7 +152,7 @@ impl UsbDriver {
             })
             .ok_or(PrintyError::Driver {
                 kind: DriverKind::Usb,
-                context: format!("Device with VID: {vid:#04x}, PID: {pid:#04x} not found"),
+                context: format!("Device (vid={vid:#04x}, pid={pid:#04x}) not found"),
                 source: None,
             })?;
 
@@ -235,6 +249,7 @@ impl Driver for UsbDriver {
     }
 
     fn write(&self, data: &[u8]) -> PrintyResult<usize> {
+        // TODO: chunk the payload if it exceeds the receive buffer size
         match self._io_with_retry(self.out_ept_addr, || {
             self.dev
                 .write_bulk(self.out_ept_addr, data, self.io_timeout)
@@ -269,26 +284,22 @@ pub struct Printer<D> {
     pub driver: D,
 }
 
-impl Printer<UsbDriver> {
+impl Printer<Box<dyn Driver>> {
     pub fn usb(vid: u16, pid: u16) -> PrintyResult<Self> {
-        Self::new(UsbDriver::new(vid, pid)?)
+        Self::new(Box::new(UsbDriver::new(vid, pid)?))
     }
-}
 
-impl Printer<DebugDriver> {
     pub fn debug() -> PrintyResult<Self> {
-        Self::new(DebugDriver)
+        Self::new(Box::new(DebugDriver))
     }
-}
 
-impl<D: Driver> Printer<D> {
-    pub fn new(driver: D) -> PrintyResult<Self> {
+    pub fn new(driver: Box<dyn Driver>) -> PrintyResult<Self> {
         let printer = Printer { driver };
         printer.init()?;
         Ok(printer)
     }
 
-    fn init(&self) -> PrintyResult<()> {
+    fn init(&self) -> PrintyResult<&Self> {
         /*
           The printer (`TM-T88IV`) seems to transmit a 7-byte long data sequence (via the BULK endpoint)
           upon powering on. This is not explicitly documented in the manual.
@@ -315,7 +326,7 @@ impl<D: Driver> Printer<D> {
         // NOTE: Only works (reliably) if the printer (`TM-T88IV`) is powered on with an ONLINE state
         // Else, `ASB` sequences will still be transmitted
         self.driver.write(CMD_DISABLE_ASB)?;
-        Ok(())
+        Ok(self)
     }
 
     pub fn status(&self) -> Option<PrinterStatus> {
@@ -334,6 +345,80 @@ impl<D: Driver> Printer<D> {
         match self.driver.read(&mut buf) {
             Ok(len) if len == buf.len() => PrinterStatus::from_bytes(&buf),
             _ => None,
+        }
+    }
+
+    pub fn cut(&self) -> PrintyResult<&Self> {
+        self.driver.write(CMD_CUT)?;
+        Ok(self)
+    }
+
+    pub fn print(&self, data: &str) -> PrintyResult<&Self> {
+        self.driver.write(data.as_bytes())?;
+        Ok(self)
+    }
+
+    pub fn print_md(&self, data: &str) -> PrintyResult<&Self> {
+        self.driver.write(&EscposMarkdown.compile(data)?)?;
+        Ok(self)
+    }
+}
+
+struct EscposMarkdown;
+
+impl EscposMarkdown {
+    pub fn compile(&self, md_str: &str) -> PrintyResult<Vec<u8>> {
+        let md_root_node = to_mdast(md_str, &markdown::ParseOptions::default()).map_err(|e| {
+            PrintyError::Parse {
+                context: format!("Failed to parse markdown - {e}"),
+                source: None,
+            }
+        })?;
+
+        let mut compiled_cmds = Vec::<u8>::new();
+        self.compile_node(&md_root_node, &mut compiled_cmds);
+        Ok(compiled_cmds)
+    }
+
+    fn compile_node(&self, node: &mdast::Node, buf: &mut Vec<u8>) {
+        match node {
+            mdast::Node::Root(root) => root
+                .children
+                .iter()
+                .for_each(|child| self.compile_node(child, buf)),
+            mdast::Node::Paragraph(para) => {
+                para.children
+                    .iter()
+                    .for_each(|child| self.compile_node(child, buf));
+                buf.extend_from_slice(b"\n\n");
+            }
+            mdast::Node::Heading(header) => {
+                let (style_cmds, reset_cmds) = match header.depth {
+                    1 => (CMD_CHAR_SIZE(1, 0).to_vec(), CMD_CHAR_SIZE(0, 0).to_vec()),
+                    2 => (
+                        [CMD_UNDERLINE(true), CMD_BOLD(true)].concat(),
+                        [CMD_UNDERLINE(false), CMD_BOLD(false)].concat(),
+                    ),
+                    3 => (CMD_BOLD(true).to_vec(), CMD_BOLD(false).to_vec()),
+                    _ => (vec![], vec![]),
+                };
+                buf.extend_from_slice(&style_cmds);
+                header
+                    .children
+                    .iter()
+                    .for_each(|child| self.compile_node(child, buf));
+                buf.extend_from_slice(&reset_cmds);
+                buf.extend_from_slice(b"\n\n");
+            }
+            mdast::Node::Text(text) => buf.extend(text.value.as_bytes()),
+            mdast::Node::Strong(bold) => {
+                buf.extend(CMD_BOLD(true));
+                bold.children
+                    .iter()
+                    .for_each(|child| self.compile_node(child, buf));
+                buf.extend(CMD_BOLD(false));
+            }
+            _ => {}
         }
     }
 }
