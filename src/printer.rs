@@ -1,7 +1,8 @@
+use hexyl;
 use rusb::{Context, DeviceHandle, Direction, TransferType, UsbContext};
 use std::{
     fmt,
-    io::{self, Write},
+    io::{self},
     thread::sleep,
     time::Duration,
 };
@@ -72,19 +73,22 @@ impl std::error::Error for PrintyError {}
 pub type PrintyResult<T> = Result<T, PrintyError>;
 
 pub trait Driver {
-    fn read(&self, buf: &mut [u8]) -> PrintyResult<usize>;
+    fn read(&mut self, buf: &mut [u8]) -> PrintyResult<usize>;
 
-    fn write(&self, data: &[u8]) -> PrintyResult<usize>;
+    fn write(&mut self, data: &[u8]) -> PrintyResult<usize>;
 
-    fn drain(&self) -> PrintyResult<()>;
+    fn drain(&mut self) -> PrintyResult<()>;
 }
 
-pub struct DebugDriver;
+#[derive(Default)]
+pub struct DebugDriver {
+    write_count: usize,
+    read_count: usize,
+}
 
 impl Driver for DebugDriver {
-    fn read(&self, buf: &mut [u8]) -> PrintyResult<usize> {
-        print!("Read (hex): ");
-        io::stdout().flush().ok();
+    fn read(&mut self, buf: &mut [u8]) -> PrintyResult<usize> {
+        println!("P <- [{}]:", self.read_count);
 
         let mut input = String::new();
         io::stdin().read_line(&mut input).ok();
@@ -103,6 +107,7 @@ impl Driver for DebugDriver {
 
         match hex_values {
             Ok(values) => {
+                self.read_count += 1;
                 let bytes_to_copy = values.len().min(buf.len());
                 buf[..bytes_to_copy].copy_from_slice(&values[..bytes_to_copy]);
                 Ok(bytes_to_copy)
@@ -116,18 +121,18 @@ impl Driver for DebugDriver {
         }
     }
 
-    fn write(&self, data: &[u8]) -> PrintyResult<usize> {
-        println!(
-            "Write: [{}]",
-            data.iter()
-                .map(|b| format!("0x{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    fn write(&mut self, data: &[u8]) -> PrintyResult<usize> {
+        println!("P -> [{}]:", self.write_count);
+
+        let mut handle = io::stdout().lock();
+        let mut hex_printer = hexyl::PrinterBuilder::new(&mut handle).build();
+        hex_printer.print_all(data).unwrap();
+
+        self.write_count += 1;
         Ok(data.len())
     }
 
-    fn drain(&self) -> PrintyResult<()> {
+    fn drain(&mut self) -> PrintyResult<()> {
         Ok(())
     }
 }
@@ -242,13 +247,13 @@ impl UsbDriver {
 }
 
 impl Driver for UsbDriver {
-    fn read(&self, buf: &mut [u8]) -> PrintyResult<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> PrintyResult<usize> {
         self._io_with_retry(self.in_ept_addr, || {
             self.dev.read_bulk(self.in_ept_addr, buf, self.io_timeout)
         })
     }
 
-    fn write(&self, data: &[u8]) -> PrintyResult<usize> {
+    fn write(&mut self, data: &[u8]) -> PrintyResult<usize> {
         // TODO: chunk the payload if it exceeds the receive buffer size
         match self._io_with_retry(self.out_ept_addr, || {
             self.dev
@@ -268,14 +273,9 @@ impl Driver for UsbDriver {
         }
     }
 
-    fn drain(&self) -> PrintyResult<()> {
+    fn drain(&mut self) -> PrintyResult<()> {
         let mut _buf = [0u8; 16];
-        loop {
-            let read_len = self.read(&mut _buf)?;
-            if read_len == 0 {
-                break;
-            }
-        }
+        while self.read(&mut _buf)? != 0 {}
         Ok(())
     }
 }
@@ -290,16 +290,16 @@ impl Printer<Box<dyn Driver>> {
     }
 
     pub fn debug() -> PrintyResult<Self> {
-        Self::new(Box::new(DebugDriver))
+        Self::new(Box::new(DebugDriver::default()))
     }
 
     pub fn new(driver: Box<dyn Driver>) -> PrintyResult<Self> {
-        let printer = Printer { driver };
+        let mut printer = Printer { driver };
         printer.init()?;
         Ok(printer)
     }
 
-    fn init(&self) -> PrintyResult<&Self> {
+    fn init(&mut self) -> PrintyResult<&Self> {
         /*
           The printer (`TM-T88IV`) seems to transmit a 7-byte long data sequence (via the BULK endpoint)
           upon powering on. This is not explicitly documented in the manual.
@@ -329,7 +329,7 @@ impl Printer<Box<dyn Driver>> {
         Ok(self)
     }
 
-    pub fn status(&self) -> Option<PrinterStatus> {
+    pub fn status(&mut self) -> Option<PrinterStatus> {
         let batched_status_cmds = [
             CMD_RT_STATUS(RtStatusReq::PrinterStatus),
             CMD_RT_STATUS(RtStatusReq::OfflineCause),
@@ -348,17 +348,17 @@ impl Printer<Box<dyn Driver>> {
         }
     }
 
-    pub fn cut(&self) -> PrintyResult<&Self> {
+    pub fn cut(&mut self) -> PrintyResult<&mut Self> {
         self.driver.write(CMD_CUT)?;
         Ok(self)
     }
 
-    pub fn print(&self, data: &str) -> PrintyResult<&Self> {
+    pub fn print(&mut self, data: &str) -> PrintyResult<&mut Self> {
         self.driver.write(data.as_bytes())?;
         Ok(self)
     }
 
-    pub fn print_md(&self, data: &str) -> PrintyResult<&Self> {
+    pub fn print_md(&mut self, data: &str) -> PrintyResult<&mut Self> {
         self.driver.write(&EscposMarkdown.compile(data)?)?;
         Ok(self)
     }

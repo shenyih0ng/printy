@@ -46,7 +46,7 @@ enum Commands {
 fn main() -> PrintyResult<()> {
     let args = Cli::parse();
 
-    let printer = match if args.debug {
+    let mut printer = match if args.debug {
         Printer::debug()
     } else {
         Printer::usb(args.usb_vendor_id, args.usb_product_id)
